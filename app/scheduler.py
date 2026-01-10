@@ -7,7 +7,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app.config import get_settings
 from app.database import async_session_maker
-from app.collectors import SteamSpyCollector, SteamStoreCollector, SteamPartnerCollector
+from app.collectors import SteamSpyCollector, SteamStoreCollector, SteamPartnerCollector, GenreCollector
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -28,6 +28,14 @@ async def collect_market_data():
     logger.info("Starting scheduled market collection")
     async with async_session_maker() as session:
         async with SteamStoreCollector(session) as collector:
+            await collector.collect()
+
+
+async def collect_genre_trends():
+    """Scheduled job: Collect genre/tag trend data."""
+    logger.info("Starting scheduled genre collection")
+    async with async_session_maker() as session:
+        async with GenreCollector(session) as collector:
             await collector.collect()
 
 
@@ -64,6 +72,15 @@ def start_scheduler():
         replace_existing=True,
     )
 
+    # Genre trends - daily (runs after market data)
+    scheduler.add_job(
+        collect_genre_trends,
+        trigger=IntervalTrigger(hours=24),
+        id="genre_trends",
+        name="Collect Genre Trends",
+        replace_existing=True,
+    )
+
     # Revenue - daily by default (only if Partner API configured)
     if settings.steam_partner_key:
         scheduler.add_job(
@@ -75,7 +92,7 @@ def start_scheduler():
         )
 
     scheduler.start()
-    logger.info("Scheduler started with jobs: portfolio_stats, market_data" +
+    logger.info("Scheduler started with jobs: portfolio_stats, market_data, genre_trends" +
                 (", revenue" if settings.steam_partner_key else ""))
 
 

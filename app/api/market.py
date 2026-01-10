@@ -1,10 +1,11 @@
 """Market intelligence API endpoints."""
 from datetime import date, timedelta
 from typing import Optional
+from collections import defaultdict
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, func, distinct
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
@@ -224,3 +225,152 @@ async def get_top_sellers(
         snapshot_date=snapshot.snapshot_date,
         rankings=snapshot.rankings or [],
     )]
+
+
+@router.get("/heatmap")
+async def get_genre_heatmap(
+    db: AsyncSession = Depends(get_session),
+    _: str = Depends(verify_api_key),
+):
+    """Get genre heat map data with scores for all tracked genres."""
+    # Get latest scores
+    latest_date_result = await db.execute(
+        select(GenreScore.score_date)
+        .order_by(GenreScore.score_date.desc())
+        .limit(1)
+    )
+    latest_date = latest_date_result.scalar_one_or_none()
+
+    if not latest_date:
+        return {"genres": [], "snapshot_date": None}
+
+    # Get all genre scores for that date
+    result = await db.execute(
+        select(GenreScore)
+        .where(GenreScore.score_date == latest_date)
+        .order_by(GenreScore.overall_score.desc())
+    )
+    scores = result.scalars().all()
+
+    # Also get the snapshot data for CCU/game counts
+    snapshot_result = await db.execute(
+        select(GenreSnapshot)
+        .where(GenreSnapshot.snapshot_date == latest_date)
+    )
+    snapshots = {s.genre: s for s in snapshot_result.scalars().all()}
+
+    genres = []
+    for score in scores:
+        snapshot = snapshots.get(score.genre)
+        genres.append({
+            "genre": score.genre,
+            "hotness": score.hotness_score,
+            "saturation": score.saturation_score,
+            "success_rate": score.success_rate_score,
+            "timing": score.timing_score,
+            "overall": score.overall_score,
+            "recommendation": score.recommendation,
+            "total_ccu": snapshot.total_ccu if snapshot else 0,
+            "game_count": snapshot.game_count if snapshot else 0,
+            "avg_review_score": snapshot.avg_review_score if snapshot else 0,
+            "top_games": (snapshot.top_games or [])[:5] if snapshot else [],
+        })
+
+    return {
+        "genres": genres,
+        "snapshot_date": latest_date.isoformat(),
+    }
+
+
+@router.get("/heatmap/history")
+async def get_genre_heatmap_history(
+    months: int = Query(3, description="Number of months of history"),
+    db: AsyncSession = Depends(get_session),
+    _: str = Depends(verify_api_key),
+):
+    """Get genre heat map history by month."""
+    start_date = date.today() - timedelta(days=months * 30)
+
+    # Get all scores in date range
+    result = await db.execute(
+        select(GenreScore)
+        .where(GenreScore.score_date >= start_date)
+        .order_by(GenreScore.score_date.asc())
+    )
+    all_scores = result.scalars().all()
+
+    # Group by month
+    monthly_data = defaultdict(lambda: defaultdict(list))
+    for score in all_scores:
+        month_key = score.score_date.strftime("%Y-%m")
+        monthly_data[month_key][score.genre].append({
+            "date": score.score_date.isoformat(),
+            "hotness": score.hotness_score,
+            "saturation": score.saturation_score,
+            "overall": score.overall_score,
+            "recommendation": score.recommendation,
+        })
+
+    # Aggregate to monthly averages
+    history = []
+    for month, genres in sorted(monthly_data.items()):
+        month_genres = []
+        for genre, scores in genres.items():
+            avg_hotness = sum(s["hotness"] for s in scores) // len(scores)
+            avg_saturation = sum(s["saturation"] for s in scores) // len(scores)
+            avg_overall = sum(s["overall"] for s in scores) // len(scores)
+            # Use latest recommendation
+            latest_rec = scores[-1]["recommendation"]
+
+            month_genres.append({
+                "genre": genre,
+                "hotness": avg_hotness,
+                "saturation": avg_saturation,
+                "overall": avg_overall,
+                "recommendation": latest_rec,
+            })
+
+        history.append({
+            "month": month,
+            "genres": sorted(month_genres, key=lambda x: x["overall"], reverse=True),
+        })
+
+    return {"history": history}
+
+
+@router.get("/scores/all")
+async def get_all_genre_scores(
+    db: AsyncSession = Depends(get_session),
+    _: str = Depends(verify_api_key),
+):
+    """Get all genre scores for heat map visualization."""
+    # Get latest date
+    latest_date_result = await db.execute(
+        select(GenreScore.score_date)
+        .order_by(GenreScore.score_date.desc())
+        .limit(1)
+    )
+    latest_date = latest_date_result.scalar_one_or_none()
+
+    if not latest_date:
+        return []
+
+    result = await db.execute(
+        select(GenreScore)
+        .where(GenreScore.score_date == latest_date)
+        .order_by(GenreScore.overall_score.desc())
+    )
+
+    return [
+        {
+            "genre": s.genre,
+            "hotness_score": s.hotness_score,
+            "saturation_score": s.saturation_score,
+            "success_rate_score": s.success_rate_score,
+            "timing_score": s.timing_score,
+            "overall_score": s.overall_score,
+            "recommendation": s.recommendation,
+            "score_date": s.score_date.isoformat(),
+        }
+        for s in result.scalars().all()
+    ]

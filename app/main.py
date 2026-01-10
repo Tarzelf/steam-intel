@@ -106,6 +106,17 @@ async def trigger_market_collection(request: Request):
     return {"status": "completed", "job": "market_data"}
 
 
+@app.post("/api/v1/admin/collect/genres")
+async def trigger_genre_collection(request: Request):
+    """Manually trigger genre trends collection."""
+    from app.api.auth import verify_api_key
+    await verify_api_key(request.headers.get("X-API-Key"))
+
+    from app.scheduler import collect_genre_trends
+    await collect_genre_trends()
+    return {"status": "completed", "job": "genre_trends"}
+
+
 # Error handlers
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
