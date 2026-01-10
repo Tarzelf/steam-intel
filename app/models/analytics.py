@@ -36,7 +36,7 @@ class PortfolioBenchmark(Base):
 
 
 class GenreScore(Base):
-    """Genre scoring for submission evaluation."""
+    """Genre scoring for submission evaluation with enhanced velocity data."""
 
     __tablename__ = "genre_scores"
     __table_args__ = (
@@ -47,7 +47,7 @@ class GenreScore(Base):
     genre = Column(String(100), nullable=False, index=True)
     score_date = Column(Date, nullable=False, index=True)
 
-    # Scores (0-100)
+    # Core scores (0-100)
     hotness_score = Column(Integer)
     saturation_score = Column(Integer)
     success_rate_score = Column(Integer)
@@ -56,5 +56,12 @@ class GenreScore(Base):
     # Overall
     overall_score = Column(Integer)
     recommendation = Column(Text)  # 'hot', 'growing', 'saturated', 'declining'
+
+    # Enhanced: Velocity & trend (new columns)
+    growth_velocity = Column(Integer)  # Week-over-week CCU change %
+    competition_score = Column(Integer)  # 0-100, based on releases + saturation
+    revenue_potential_score = Column(Integer)  # Based on avg price * success rate
+    discoverability_score = Column(Integer)  # Based on median review count
+    trend_direction = Column(String(20))  # 'rising', 'stable', 'declining'
 
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow)

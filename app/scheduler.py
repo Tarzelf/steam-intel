@@ -7,7 +7,14 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app.config import get_settings
 from app.database import async_session_maker
-from app.collectors import SteamSpyCollector, SteamStoreCollector, SteamPartnerCollector, GenreCollector
+from app.collectors import (
+    SteamSpyCollector,
+    SteamStoreCollector,
+    SteamPartnerCollector,
+    GenreCollector,
+    TagCorrelationCollector,
+    UpcomingReleasesCollector,
+)
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -51,6 +58,22 @@ async def collect_revenue():
             await collector.collect()
 
 
+async def collect_tag_correlations():
+    """Scheduled job: Analyze tag correlations for market insights."""
+    logger.info("Starting scheduled tag correlation analysis")
+    async with async_session_maker() as session:
+        async with TagCorrelationCollector(session) as collector:
+            await collector.collect()
+
+
+async def collect_upcoming_releases():
+    """Scheduled job: Collect upcoming releases for competitive intel."""
+    logger.info("Starting scheduled upcoming releases collection")
+    async with async_session_maker() as session:
+        async with UpcomingReleasesCollector(session) as collector:
+            await collector.collect()
+
+
 def start_scheduler():
     """Start the background scheduler with all jobs."""
     # Portfolio stats - every 6 hours by default
@@ -91,9 +114,29 @@ def start_scheduler():
             replace_existing=True,
         )
 
+    # Tag correlations - daily (runs after genre collection)
+    scheduler.add_job(
+        collect_tag_correlations,
+        trigger=IntervalTrigger(hours=24),
+        id="tag_correlations",
+        name="Analyze Tag Correlations",
+        replace_existing=True,
+    )
+
+    # Upcoming releases - every 12 hours
+    scheduler.add_job(
+        collect_upcoming_releases,
+        trigger=IntervalTrigger(hours=12),
+        id="upcoming_releases",
+        name="Collect Upcoming Releases",
+        replace_existing=True,
+    )
+
     scheduler.start()
-    logger.info("Scheduler started with jobs: portfolio_stats, market_data, genre_trends" +
-                (", revenue" if settings.steam_partner_key else ""))
+    jobs = ["portfolio_stats", "market_data", "genre_trends", "tag_correlations", "upcoming_releases"]
+    if settings.steam_partner_key:
+        jobs.append("revenue")
+    logger.info(f"Scheduler started with jobs: {', '.join(jobs)}")
 
 
 def stop_scheduler():
