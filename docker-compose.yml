@@ -1,4 +1,8 @@
-version: '3.8'
+networks:
+  web:
+    external: true
+  internal:
+    driver: bridge
 
 services:
   db:
@@ -12,7 +16,9 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./migrations/init.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
-      - "5433:5432"  # Different port to avoid conflicts
+      - "5433:5432"
+    networks:
+      - internal
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
@@ -33,8 +39,23 @@ services:
       db:
         condition: service_healthy
     restart: unless-stopped
+    networks:
+      - web
+      - internal
     volumes:
       - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.steam-intel.rule=Host(`api.alorfutures.com`) && PathPrefix(`/steam`)"
+      - "traefik.http.routers.steam-intel.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.steam-intel.middlewares=steam-strip"
+      - "traefik.http.middlewares.steam-strip.stripprefix.prefixes=/steam"
+      - "traefik.http.services.steam-intel.loadbalancer.server.port=8080"
 
 volumes:
   postgres_data:
