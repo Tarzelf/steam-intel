@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from app.config import get_settings
 from app.database import init_db
 from app.scheduler import start_scheduler, stop_scheduler
-from app.api import portfolio_router, market_router, analyze_router, revenue_router
+from app.api import portfolio_router, market_router, analyze_router, revenue_router, steam_news_router
 
 # Configure logging
 logging.basicConfig(
@@ -81,6 +81,7 @@ app.include_router(portfolio_router, prefix="/api/v1")
 app.include_router(market_router, prefix="/api/v1")
 app.include_router(analyze_router, prefix="/api/v1")
 app.include_router(revenue_router, prefix="/api/v1")
+app.include_router(steam_news_router, prefix="/api/v1")
 
 
 # Manual trigger endpoints (for admin use)
