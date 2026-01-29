@@ -51,7 +51,9 @@ services:
       retries: 3
     labels:
       - "traefik.enable=true"
+      - "traefik.docker.network=web"
       - "traefik.http.routers.steam-intel.rule=Host(`api.alorfutures.com`) && PathPrefix(`/steam`)"
+      - "traefik.http.routers.steam-intel.entrypoints=websecure"
       - "traefik.http.routers.steam-intel.tls.certresolver=letsencrypt"
       - "traefik.http.routers.steam-intel.middlewares=steam-strip"
       - "traefik.http.middlewares.steam-strip.stripprefix.prefixes=/steam"
