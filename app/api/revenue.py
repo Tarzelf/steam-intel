@@ -34,6 +34,29 @@ class GameRevenueResponse(BaseModel):
     periods: list[dict]
 
 
+class SyncRequest(BaseModel):
+    """Request to trigger a sync."""
+    days: Optional[int] = None
+    full_sync: bool = False
+
+
+class SyncResponse(BaseModel):
+    """Response from sync."""
+    success: bool
+    dates_processed: int
+    records_upserted: int
+    errors: list[str]
+    new_highwatermark: str
+
+
+class SyncStatusResponse(BaseModel):
+    """Sync status."""
+    last_sync_at: Optional[str] = None
+    last_sync_status: Optional[str] = None
+    configured_games: int
+    total_revenue_records: int
+
+
 @router.get("/summary", response_model=RevenueSummaryResponse)
 async def get_revenue_summary(
     period: str = Query("30d", regex="^\\d+d$"),
@@ -44,7 +67,6 @@ async def get_revenue_summary(
     days = int(period.rstrip("d"))
     start_date = date.today() - timedelta(days=days)
 
-    # Aggregate by game
     result = await db.execute(
         select(
             RevenueRecord.app_id,
@@ -63,7 +85,6 @@ async def get_revenue_summary(
     total_units = 0
 
     for row in rows:
-        # Get game name
         game_result = await db.execute(
             select(Game.name).where(Game.app_id == row.app_id)
         )
@@ -90,6 +111,130 @@ async def get_revenue_summary(
     )
 
 
+@router.post("/sync", response_model=SyncResponse)
+async def sync_revenue(
+    request: SyncRequest,
+    db: AsyncSession = Depends(get_session),
+    _: str = Depends(verify_api_key),
+):
+    """Trigger Steam Partner Financials sync."""
+    from app.collectors.partner_financials import run_partner_sync
+
+    result = await run_partner_sync(
+        db,
+        full_sync=request.full_sync,
+        days=request.days,
+    )
+
+    return SyncResponse(
+        success=result.get("success", False),
+        dates_processed=result.get("dates_processed", 0),
+        records_upserted=result.get("records_upserted", 0),
+        errors=result.get("errors", []),
+        new_highwatermark=result.get("new_highwatermark", "0"),
+    )
+
+
+@router.get("/status", response_model=SyncStatusResponse)
+async def get_sync_status(
+    db: AsyncSession = Depends(get_session),
+    _: str = Depends(verify_api_key),
+):
+    """Get sync status."""
+    from app.models import CollectionRun
+
+    last_run = await db.execute(
+        select(CollectionRun)
+        .where(CollectionRun.collector_name == "partner_financials")
+        .order_by(CollectionRun.completed_at.desc())
+        .limit(1)
+    )
+    run = last_run.scalar_one_or_none()
+
+    games_count = await db.execute(
+        select(func.count()).where(Game.app_id.isnot(None))
+    )
+    records_count = await db.execute(
+        select(func.count()).select_from(RevenueRecord)
+        .where(RevenueRecord.source == "partner_api")
+    )
+
+    return SyncStatusResponse(
+        last_sync_at=run.completed_at.isoformat() if run and run.completed_at else None,
+        last_sync_status="success" if run and not run.error_message else "error" if run else None,
+        configured_games=games_count.scalar() or 0,
+        total_revenue_records=records_count.scalar() or 0,
+    )
+
+
+@router.post("/backfill")
+async def backfill_revenue(
+    db: AsyncSession = Depends(get_session),
+    _: str = Depends(verify_api_key),
+):
+    """Run full historical backfill."""
+    from app.collectors.partner_financials import run_partner_sync
+    return await run_partner_sync(db, full_sync=True)
+
+
+@router.post("/upload")
+async def upload_revenue_csv(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_session),
+    _: str = Depends(verify_api_key),
+):
+    """Upload a Steamworks revenue CSV for manual import."""
+    from app.collectors.partner import RevenueImporter
+    from sqlalchemy.dialects.postgresql import insert
+
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="File must be a CSV")
+
+    content = await file.read()
+    csv_content = content.decode("utf-8")
+
+    try:
+        records = RevenueImporter.parse_steamworks_csv(csv_content)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse CSV: {e}")
+
+    imported = 0
+    for record in records:
+        game_result = await db.execute(
+            select(Game.id).where(Game.app_id == record["app_id"])
+        )
+        game_id = game_result.scalar_one_or_none()
+
+        stmt = insert(RevenueRecord).values(
+            game_id=game_id,
+            app_id=record["app_id"],
+            period_start=record["period_start"],
+            period_end=record["period_end"],
+            period_type="monthly",
+            gross_revenue_cents=record["gross_revenue_cents"],
+            net_revenue_cents=record["net_revenue_cents"],
+            units_sold=record["units_sold"],
+            refunds=record["refunds"],
+            source="csv_upload",
+        )
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_revenue_period",
+            set_={
+                "gross_revenue_cents": stmt.excluded.gross_revenue_cents,
+                "net_revenue_cents": stmt.excluded.net_revenue_cents,
+                "units_sold": stmt.excluded.units_sold,
+                "refunds": stmt.excluded.refunds,
+            }
+        )
+        await db.execute(stmt)
+        imported += 1
+
+    await db.commit()
+
+    return {"imported": imported, "message": f"Successfully imported {imported} revenue records"}
+
+
+# /{app_id} must be LAST - it is a catch-all route
 @router.get("/{app_id}", response_model=GameRevenueResponse)
 async def get_game_revenue(
     app_id: int,
@@ -101,7 +246,6 @@ async def get_game_revenue(
     days = int(period.rstrip("d"))
     start_date = date.today() - timedelta(days=days)
 
-    # Get game
     game_result = await db.execute(
         select(Game).where(Game.app_id == app_id)
     )
@@ -109,7 +253,6 @@ async def get_game_revenue(
     if not game:
         raise HTTPException(status_code=404, detail="Game not found")
 
-    # Get revenue records
     result = await db.execute(
         select(RevenueRecord)
         .where(RevenueRecord.app_id == app_id)
@@ -145,156 +288,3 @@ async def get_game_revenue(
         total_units=total_units,
         periods=periods,
     )
-
-
-@router.post("/upload")
-async def upload_revenue_csv(
-    file: UploadFile = File(...),
-    db: AsyncSession = Depends(get_session),
-    _: str = Depends(verify_api_key),
-):
-    """Upload a Steamworks revenue CSV for manual import."""
-    from app.collectors.partner import RevenueImporter
-    from sqlalchemy.dialects.postgresql import insert
-
-    if not file.filename.endswith(".csv"):
-        raise HTTPException(status_code=400, detail="File must be a CSV")
-
-    content = await file.read()
-    csv_content = content.decode("utf-8")
-
-    try:
-        records = RevenueImporter.parse_steamworks_csv(csv_content)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to parse CSV: {e}")
-
-    imported = 0
-    for record in records:
-        # Get game_id
-        game_result = await db.execute(
-            select(Game.id).where(Game.app_id == record["app_id"])
-        )
-        game_id = game_result.scalar_one_or_none()
-
-        stmt = insert(RevenueRecord).values(
-            game_id=game_id,
-            app_id=record["app_id"],
-            period_start=record["period_start"],
-            period_end=record["period_end"],
-            period_type="monthly",
-            gross_revenue_cents=record["gross_revenue_cents"],
-            net_revenue_cents=record["net_revenue_cents"],
-            units_sold=record["units_sold"],
-            refunds=record["refunds"],
-            source="csv_upload",
-        )
-        stmt = stmt.on_conflict_do_update(
-            constraint="uq_revenue_period",
-            set_={
-                "gross_revenue_cents": stmt.excluded.gross_revenue_cents,
-                "net_revenue_cents": stmt.excluded.net_revenue_cents,
-                "units_sold": stmt.excluded.units_sold,
-                "refunds": stmt.excluded.refunds,
-            }
-        )
-        await db.execute(stmt)
-        imported += 1
-
-    await db.commit()
-
-    return {"imported": imported, "message": f"Successfully imported {imported} revenue records"}
-
-
-# ============================================================
-# Partner Financials Sync Endpoints
-# ============================================================
-
-class SyncRequest(BaseModel):
-    """Request to trigger a sync."""
-    days: Optional[int] = None
-    full_sync: bool = False
-
-
-class SyncResponse(BaseModel):
-    """Response from sync."""
-    success: bool
-    dates_processed: int
-    records_upserted: int
-    errors: list[str]
-    new_highwatermark: str
-
-
-class SyncStatusResponse(BaseModel):
-    """Sync status."""
-    last_sync_at: Optional[str] = None
-    last_sync_status: Optional[str] = None
-    configured_games: int
-    total_revenue_records: int
-
-
-@router.post("/sync", response_model=SyncResponse)
-async def sync_revenue(
-    request: SyncRequest,
-    db: AsyncSession = Depends(get_session),
-    _: str = Depends(verify_api_key),
-):
-    """Trigger Steam Partner Financials sync."""
-    from app.collectors.partner_financials import run_partner_sync
-
-    result = await run_partner_sync(
-        db,
-        full_sync=request.full_sync,
-        days=request.days,
-    )
-
-    return SyncResponse(
-        success=result.get("success", False),
-        dates_processed=result.get("dates_processed", 0),
-        records_upserted=result.get("records_upserted", 0),
-        errors=result.get("errors", []),
-        new_highwatermark=result.get("new_highwatermark", "0"),
-    )
-
-
-@router.get("/status", response_model=SyncStatusResponse)
-async def get_sync_status(
-    db: AsyncSession = Depends(get_session),
-    _: str = Depends(verify_api_key),
-):
-    """Get sync status."""
-    from app.models import CollectionRun
-
-    # Last sync
-    last_run = await db.execute(
-        select(CollectionRun)
-        .where(CollectionRun.collector_name == "partner_financials")
-        .order_by(CollectionRun.completed_at.desc())
-        .limit(1)
-    )
-    run = last_run.scalar_one_or_none()
-
-    # Counts
-    games_count = await db.execute(
-        select(func.count()).where(Game.app_id.isnot(None))
-    )
-    records_count = await db.execute(
-        select(func.count()).select_from(RevenueRecord)
-        .where(RevenueRecord.source == "partner_api")
-    )
-
-    return SyncStatusResponse(
-        last_sync_at=run.completed_at.isoformat() if run and run.completed_at else None,
-        last_sync_status="success" if run and not run.error_message else "error" if run else None,
-        configured_games=games_count.scalar() or 0,
-        total_revenue_records=records_count.scalar() or 0,
-    )
-
-
-@router.post("/backfill")
-async def backfill_revenue(
-    db: AsyncSession = Depends(get_session),
-    _: str = Depends(verify_api_key),
-):
-    """Run full historical backfill."""
-    from app.collectors.partner_financials import run_partner_sync
-    return await run_partner_sync(db, full_sync=True)
