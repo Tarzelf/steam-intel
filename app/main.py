@@ -1,6 +1,7 @@
 """Steam Intelligence Service - FastAPI Application."""
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -47,7 +48,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict this
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -59,9 +60,6 @@ app.add_middleware(
 async def health_check():
     """Health check endpoint (ALOR Services standard)."""
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat(), "service": "steam-intel"}
-
-
-from datetime import datetime
 
 
 # Root info
@@ -118,14 +116,24 @@ async def trigger_genre_collection(request: Request):
     return {"status": "completed", "job": "genre_trends"}
 
 
-# Error handlers
+# Error handlers with explicit CORS headers
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
-    """Handle uncaught exceptions."""
+    """Handle uncaught exceptions with CORS headers."""
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    
+    # Get origin from request
+    origin = request.headers.get("origin", "*")
+    
     return JSONResponse(
         status_code=500,
         content={"detail": "Internal server error"},
+        headers={
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+        },
     )
 
 
