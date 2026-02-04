@@ -11,8 +11,10 @@ engine = create_async_engine(
     settings.database_url,
     echo=settings.debug,
     pool_pre_ping=True,
-    pool_size=5,
-    max_overflow=10,
+    pool_size=20,        # Increased from 5 to handle concurrent requests
+    max_overflow=10,     # Allow 10 additional overflow connections
+    pool_timeout=30,     # Wait up to 30 seconds for a connection
+    pool_recycle=3600,   # Recycle connections after 1 hour
 )
 
 # Session factory
