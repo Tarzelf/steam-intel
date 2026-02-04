@@ -34,6 +34,13 @@ class GameRevenueResponse(BaseModel):
     periods: list[dict]
 
 
+class BatchRevenueResponse(BaseModel):
+    """Batched revenue for multiple games."""
+    period_start: date
+    period_end: date
+    games: list[dict]
+
+
 class SyncRequest(BaseModel):
     """Request to trigger a sync."""
     days: Optional[int] = None
@@ -232,6 +239,94 @@ async def upload_revenue_csv(
     await db.commit()
 
     return {"imported": imported, "message": f"Successfully imported {imported} revenue records"}
+
+
+@router.get("/batch", response_model=BatchRevenueResponse)
+async def get_batch_revenue(
+    app_ids: str = Query(..., description="Comma-separated Steam App IDs"),
+    period: str = Query("30d", regex="^\\d+d$"),
+    db: AsyncSession = Depends(get_session),
+    _: str = Depends(verify_api_key),
+):
+    """Get revenue for multiple games in a single request.
+    
+    Performance optimized endpoint that returns data for multiple games
+    using a single database query instead of N separate queries.
+    
+    Args:
+        app_ids: Comma-separated list of Steam App IDs (e.g. "2602030,1129260,2074740")
+        period: Time period like 7d, 30d, 90d, 180d, 365d (default: 30d)
+    
+    Returns:
+        Batched response with revenue data for all requested games
+    """
+    # Parse app IDs
+    try:
+        ids = [int(id.strip()) for id in app_ids.split(",") if id.strip()]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid app_ids format. Must be comma-separated integers.")
+    
+    if not ids:
+        raise HTTPException(status_code=400, detail="At least one app_id is required")
+    
+    if len(ids) > 50:
+        raise HTTPException(status_code=400, detail="Maximum 50 app_ids per request")
+    
+    # Calculate date range
+    days = int(period.rstrip("d"))
+    end_date = date.today()
+    start_date = end_date - timedelta(days=days)
+    
+    # Fetch games metadata
+    games_result = await db.execute(
+        select(Game.app_id, Game.name)
+        .where(Game.app_id.in_(ids))
+    )
+    games_map = {row.app_id: row.name for row in games_result}
+    
+    # Single database query for all games
+    result = await db.execute(
+        select(RevenueRecord)
+        .where(RevenueRecord.app_id.in_(ids))
+        .where(RevenueRecord.period_start >= start_date)
+        .order_by(RevenueRecord.app_id, RevenueRecord.period_start.asc())
+    )
+    records = result.scalars().all()
+    
+    # Group by game
+    games_data = {}
+    for app_id in ids:
+        games_data[app_id] = {
+            "app_id": app_id,
+            "name": games_map.get(app_id, f"App {app_id}"),
+            "total_gross_cents": 0,
+            "total_net_cents": 0,
+            "total_units": 0,
+            "periods": []
+        }
+    
+    for record in records:
+        if record.app_id not in games_data:
+            continue
+            
+        games_data[record.app_id]["total_gross_cents"] += record.gross_revenue_cents or 0
+        games_data[record.app_id]["total_net_cents"] += record.net_revenue_cents or 0
+        games_data[record.app_id]["total_units"] += record.units_sold or 0
+        games_data[record.app_id]["periods"].append({
+            "period_start": record.period_start.isoformat(),
+            "period_end": record.period_end.isoformat(),
+            "period_type": record.period_type,
+            "gross_cents": record.gross_revenue_cents or 0,
+            "net_cents": record.net_revenue_cents or 0,
+            "units": record.units_sold or 0,
+            "refunds": record.refunds or 0,
+        })
+    
+    return BatchRevenueResponse(
+        period_start=start_date,
+        period_end=end_date,
+        games=list(games_data.values()),
+    )
 
 
 # /{app_id} must be LAST - it is a catch-all route
